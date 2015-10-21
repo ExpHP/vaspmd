@@ -86,39 +86,41 @@ def _main(mddir, *, temperature, from_zero, blocksize, linear_steps, nose_steps,
 		from subprocess import check_call
 		check_call(VASP_BIN_NAME, shell=True)
 
-	def iter_stages():
-		prevdir = None
-		for num in iota(1):
-			for stage in (STAGE_LINEAR, STAGE_NOSE, STAGE_NVE):
-				curdir = stage_dir_name(num=num, stage=stage)
-				yield stage, curdir, prevdir
-				prevdir = curdir
+	start = (1, STAGE_LINEAR, 0 if from_zero else temperature, None)
+	def next_stage(num, stage, prevtemp, prevdir):
+		nonlocal endtemp, curdir # close over these
+		del prevtemp, prevdir # irrelevant
 
-	prev_end_temp = 0 if from_zero else temperature
-	def do_stage(stage, curdir):
-		nonlocal prev_end_temp # Terrible terrible hack
-		                       # We just reassign this whenever we can
+		if stage == STAGE_LINEAR:  stage = STAGE_NOSE
+		elif stage == STAGE_NOSE:  stage = STAGE_NVE
+		elif stage == STAGE_NVE:   stage = STAGE_LINEAR;  num += 1
 
-		with pushd(curdir):
-			for _ in runonce('md.has_run'):
+		return (num, stage, endtemp, curdir)
+
+	with pushd(mddir):
+
+		for num, stage, prevtemp, prevdir in persistent_loop(
+				next_stage, path='md.state', initialstate=start
+		):
+			curdir = stage_dir_name(num=num, stage=stage)
+			make_trial_subdir(root='.', name=curdir, continue_from_name=prevdir)
+
+			cat_files('INCAR.part', 'INCAR.%s'%stage, dest=join(curdir,'INCAR'))
+
+			with pushd(curdir):
 
 				if stage == STAGE_LINEAR:
-					do_linear(vasp_cmd, steps=linear_steps, from_temp=prev_end_temp)
+					oszidir = do_linear(vasp_cmd, steps=linear_steps, from_temp=starttemp)
 
 				elif stage == STAGE_NOSE:
-					do_nose(vasp_cmd, steps=nose_steps)
+					oszidir = do_nose(vasp_cmd, steps=nose_steps)
 
 				elif stage == STAGE_NVE:
-					do_nve(vasp_cmd, steps=nve_steps, blocksize=blocksize)
-					prev_end_temp = int(stripped_lines(VARFILE_FINAL_TEMP)[0])
+					oszidir = do_nve(vasp_cmd, steps=nve_steps, blocksize=blocksize)
 
 				else: assert False, 'complete switch'
 
-	with pushd(mddir):
-		for stage, d, prev in iter_stages():
-			make_trial_subdir(root='.', name=d, continue_from_name=prev)
-			cat_files('INCAR.part', 'INCAR.%s'%stage, dest=join(d,'INCAR'))
-			do_stage(stage, d)
+				endtemp = read_final_temp(join(oszidir, 'OSZICAR'))
 
 def stage_dir_name(*, num, stage):
 	return '{}-{}'.format(num,stage)
@@ -158,6 +160,8 @@ def do_linear(vasp_cmd, *, steps, from_temp):
 
 	vasp_cmd()
 
+	# TODO return dirs
+
 def do_nve(vasp_cmd, *, steps, blocksize):
 	for _ in runonce('nve.has_init'):
 		# set up a series run
@@ -188,10 +192,14 @@ def do_nve(vasp_cmd, *, steps, blocksize):
 	with open(VARFILE_FINAL_TEMP, 'wt') as f:
 		f.write('%s\n'%temperature)
 
+	# TODO return dirs
+
 def do_nose(vasp_cmd, *, steps):
 	file_subst('INCAR', STEPS_REPL, steps)
 
 	vasp_cmd()
+
+	# TODO return dirs
 
 
 
@@ -349,26 +357,62 @@ def touch(path):
 # Some very un-Pythonic syntax hacks in an attempt to make the code
 #  easier to read and verify
 
-# TODO kill 'runonce', it increases the number of paths through the code
-#   and actually makes it MORE difficult to reason about correctness
+class EndLoop():
+	def __init__(self):
+		raise NotImplementedError
 
-# Conditionally perform actions only if a certain file does not exist,
-#  and create it once we're done.
+# Make a sort of iterator that records its current state in a file.
 #
-# The way it works is as an iterator which creates the file on the
-#  second iteration (and which does zero iterations if the file already
-#  exists)
+#  f(tuple) -> tuple   a (pure) state transition function which should return EndLoop when done.
+#  path                where to save the state
+#  initialstate        initial state
 #
-# Use it like this:
-#     for _ in runonce('./has_initialized'):
-#         ... # do things if the file 'has_initialized' does not exist
-#     # upon exiting the block successfully, the file is created.
+# Use like this:
 #
-def runonce(markerfile):
-	if not exists(markerfile):
-		yield None # do one iteration
-		with open(markerfile, 'a'):
-			pass # create file
+#     # range(n) written in the form of a state transition function
+#     def get_next_state(i, n):
+#         if i+1 == n:
+#             return EndLoop
+#         return i+1, n
+#
+#     for i in persistent_loop(get_next_state, 'numbers', initialstate=(0,10)):
+#         ...  # do things that have side-effects.
+#
+# The code in the for loop must anticipate the following contingencies:
+#   * That any number of iterations at the beginning may be skipped
+#     (because they already ran in a previous run of the program)
+#   * That the state of the environment at the beginning of any given iteration may
+#     reflect changes from a previously interrupted run of the same iteration
+#
+# It would be great if this could be written to take an iterator instead,
+#   but not even dill can serialize a generator!
+# (well, technically, it can, but it can't DEserialize it...)
+def persistent_loop(f, path, initialstate=None):
+	def load():
+		from dill import load as _load
+		with open(path, 'rb') as f:
+			return _load(f)
+
+	def save(st):
+		from dill import dump
+		from os import rename
+		tmppath = path + '.tmp'
+		with open(tmppath, 'wb') as f:
+			dump(st, f)
+		rename(tmppath, path) # TODO is this atomic?
+
+	if not exists(path):
+		save(initialstate)
+
+	while True:
+		state = load()
+		if state is EndLoop:
+			break
+		yield state
+
+		state = f(*state)
+
+		save(state)
 
 # Like a shell pushd/popd pair
 # Use via 'with' syntax, like this:
