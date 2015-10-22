@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-#SBATCH -J md-runner
-
 # This script is written in such a way as to maximize the code surface
 #  area checkable by e.g. pylint, because it REALLY SUCKS to wait for
 #  hours in a slurm queue only to discover that we made a typo.

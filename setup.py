@@ -21,10 +21,12 @@ setup(
 	entry_points={
 		'console_scripts':[
 			'md-init = vaspmd.md_init:main',
-			# can't put the "run" script here because it's meant to be invoked directly
-			#  by sbatch (and setup.py only installs a wrapper script)
 		],
 	},
+
+	scripts=[
+		'scripts/md-run',
+	],
 
 	install_requires=[
 	],
