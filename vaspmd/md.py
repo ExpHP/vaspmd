@@ -11,8 +11,8 @@
 #   * config reading done directly in main
 #     (this COULD be done via a Config class with properties, but it'd be pointless because
 #      I still wouldn't want to pass around a config *object*; see the next point)
-#   * everything in one module (pylint's argument checker can't cross module boundaries)
 #   * long argument lists (to allow linting against unused arguments)
+#   * everything in one module (pylint's argument checker can't cross module boundaries)
 #
 # I am not proud.
 
