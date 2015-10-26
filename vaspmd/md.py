@@ -16,7 +16,7 @@
 #
 # I am not proud.
 
-from os.path import join, exists, isdir
+from os.path import join, exists, isdir, relpath
 
 VASP_BIN_NAME = 'vasp.g.slm'
 
@@ -37,13 +37,12 @@ STEPS_REPL = '数'
 
 START_NUM = 1
 
-VARFILE_SERIES_ALLDIRS = 'series.alldirs'
+VARFILE_MD_ALLDIRS     = 'md.leaves'
 VARFILE_FINAL_TEMP     = 'md.final-temp'
 
 def main():
 	from argparse import ArgumentParser
 	from json import load
-	from os import getcwd
 	parser = ArgumentParser()
 	parser.parse_args()
 
@@ -54,7 +53,6 @@ def main():
 		parser.error('missing md.conf!')
 
 	_main(
-		mddir        = getcwd(),
 		temperature  = conf.pop(CONF_TEMPERATURE),
 		from_zero    = conf.pop(CONF_FROM_ZERO),
 		blocksize    = conf.pop(CONF_BLOCKSIZE),
@@ -77,48 +75,64 @@ def write_conf(mddir, *, temperature, from_zero, blocksize, linear_steps, nose_s
 	with open(join(mddir, 'md.conf'), 'w') as f:
 		dump(conf, f, indent=1)
 
-def _main(mddir, *, temperature, from_zero, blocksize, linear_steps, nose_steps, nve_steps, unknown):
+def _main(*, temperature, from_zero, blocksize, linear_steps, nose_steps, nve_steps, unknown):
 	from warnings import warn
 	for arg in unknown:
 		warn('Unknown key in config: {!r}'.format(arg))
 
-	def vasp_cmd():
-		from subprocess import check_call
-		check_call(VASP_BIN_NAME, shell=True)
+	# state tuple contents:
+	#   num:      Current iteration of the main loop (which does each stage in order)
+	#   stage:    Which stage are we currently on
+	#   prevtemp: Temperature of system at end of previous run. (for the linear stage
+	#              to start at)
+	#   prevdir:  Directory associated with the previous stage, or None.
+	#              (used to locate CONTCAR, WAVECAR)
+	#   leaves:   A list of all previous 'leaf' nodes in the computation tree; these are
+	#              directories where vasp was run directly, and where you will find e.g.
+	#              vasprun.xml and OSZICAR files
 
-	def iter_stages():
-		prevdir = None
-		for num in iota(1):
-			for stage in (STAGE_LINEAR, STAGE_NOSE, STAGE_NVE):
-				curdir = stage_dir_name(num=num, stage=stage)
-				yield stage, curdir, prevdir
-				prevdir = curdir
+	initial_temp = 0 if from_zero else temperature
+	def do_iter(num=1, stage=STAGE_LINEAR, prevtemp=initial_temp, prevdir=None, leaves=()):
 
-	prev_end_temp = 0 if from_zero else temperature
-	def do_stage(stage, curdir):
-		nonlocal prev_end_temp # Terrible terrible hack
-		                       # We just reassign this whenever we can
+		curdir = stage_dir_name(num=num, stage=stage)
+		make_trial_subdir(curdir, prevdir)
+
+		cat_files('INCAR.part', 'INCAR.%s'%stage, dest=join(curdir,'INCAR'))
 
 		with pushd(curdir):
-			for _ in runonce('md.has_run'):
+			newleaves = do_stage(do_vasp, stage=stage, prevtemp=prevtemp, blocksize=blocksize,
+					linear_steps=linear_steps, nose_steps=nose_steps, nve_steps=nve_steps,
+			)
 
-				if stage == STAGE_LINEAR:
-					do_linear(vasp_cmd, steps=linear_steps, from_temp=prev_end_temp)
+			# we ultimately want these saved as paths relative to the md root dir
+			newleaves = tuple([relpath(x, '..') for x in newleaves])
 
-				elif stage == STAGE_NOSE:
-					do_nose(vasp_cmd, steps=nose_steps)
+		endtemp  = read_final_temp(join(newleaves[-1], 'OSZICAR'))
+		leaves += tuple(newleaves)
+		newnum, newstage = next_stage(num=num, stage=stage)
 
-				elif stage == STAGE_NVE:
-					do_nve(vasp_cmd, steps=nve_steps, blocksize=blocksize)
-					prev_end_temp = int(stripped_lines(VARFILE_FINAL_TEMP)[0])
+		write_lines(leaves, VARFILE_MD_ALLDIRS)
 
-				else: assert False, 'complete switch'
+		return (newnum, newstage, endtemp, curdir, leaves)
 
-	with pushd(mddir):
-		for stage, d, prev in iter_stages():
-			make_trial_subdir(root='.', name=d, continue_from_name=prev)
-			cat_files('INCAR.part', 'INCAR.%s'%stage, dest=join(d,'INCAR'))
-			do_stage(stage, d)
+	persistent_loop(do_iter, path='md.state')
+
+def next_stage(num, stage):
+	if stage == STAGE_LINEAR:  return (num,   STAGE_NOSE)
+	elif stage == STAGE_NOSE:  return (num,   STAGE_NVE)
+	elif stage == STAGE_NVE:   return (num+1, STAGE_LINEAR)
+	else: assert False, 'complete switch'
+
+# Expects to be in a stage directory, with POSCAR/KPOINTS/POTCAR, and an INCAR
+#   that still requires substitution for NSW and/or possibly TEBEG
+def do_stage(vasp_cmd, *, stage, prevtemp, blocksize, linear_steps, nose_steps, nve_steps):
+	if stage == STAGE_LINEAR:
+		return do_linear(vasp_cmd, steps=linear_steps, from_temp=prevtemp)
+	elif stage == STAGE_NOSE:
+		return do_nose(vasp_cmd, steps=nose_steps)
+	elif stage == STAGE_NVE:
+		return do_nve(vasp_cmd, steps=nve_steps, blocksize=blocksize)
+	else: assert False, 'complete switch'
 
 def stage_dir_name(*, num, stage):
 	return '{}-{}'.format(num,stage)
@@ -127,30 +141,32 @@ def stage_dir_name(*, num, stage):
 #-----------------------------------------------------
 
 # Handles creation of non-INCAR input files for a 'sub-trial'
-def make_trial_subdir(root, name, continue_from_name=None):
+def make_trial_subdir(name, continue_from_name=None):
+	from os.path import sep
+	if sep in name:
+		raise ValueError('name must be a single path component, not {!r}'.format(name))
 
-	with pushd(root):
-		mkdir(name)
-		with pushd(name):
-			symlink('../POTCAR', 'POTCAR')
-			symlink('../KPOINTS', 'KPOINTS')
+	mkdir(name)
+	with pushd(name):
+		symlink('../POTCAR', 'POTCAR')
+		symlink('../KPOINTS', 'KPOINTS')
 
-		if continue_from_name is None:
-			symlink('../POSCAR', join(name, 'POSCAR'))
-			copy_if_exists('WAVECAR', join(name, 'WAVECAR'))
-		else:
-			prev = continue_from_name
-			copy_file(join(prev, 'WAVECAR'), join(name, 'WAVECAR'))
-			copy_file(join(prev, 'CONTCAR'), join(name, 'POSCAR'))
+	if continue_from_name is None:
+		symlink('../POSCAR', join(name, 'POSCAR'))
+		copy_if_exists('WAVECAR', join(name, 'WAVECAR'))
+	else:
+		prev = continue_from_name
+		copy_file(join(prev, 'WAVECAR'), join(name, 'WAVECAR'))
+		copy_file(join(prev, 'CONTCAR'), join(name, 'POSCAR'))
 
 
 #-------------------------------------
-# FIXME outdated comment
-# init methods
-# Called on a stage directory once it has POSCAR, KPOINTS, INCAR, and POTCAR
-#  to perform initialization specific to the stage type.
-# Might be used to perform additional substitutions into the INCAR file, or to
-#  set up a sequence of trials for a multipart run.
+# 'do_x' functions
+# Similar to VASP, these expect a POSCAR, KPOINTS, INCAR, and POTCAR in the current directory,
+#  and produce at minimum a WAVECAR and a CONTCAR.
+# They may perform initialization specific to the stage type (such as additional substitutions
+#  into INCAR), and they may or may not further divide their work up into multiple VASP runs.
+#  They return a list of "leaf" directories (as paths relative to '.') where VASP was run directly.
 
 def do_linear(vasp_cmd, *, steps, from_temp):
 	file_subst('INCAR', STEPS_REPL, steps)
@@ -158,42 +174,60 @@ def do_linear(vasp_cmd, *, steps, from_temp):
 
 	vasp_cmd()
 
+	return ['.']
+
 def do_nve(vasp_cmd, *, steps, blocksize):
-	for _ in runonce('nve.has_init'):
-		# set up a series run
-		fullblocks, remainder = divmod(steps, blocksize)
-		extrablock = (1 if remainder else 0)
 
-		part_names = ['{:03d}'.format(i+1) for i in range(fullblocks + extrablock)]
-		part_sizes = [blocksize]*fullblocks + [remainder]*extrablock
-		assert len(part_names) == len(part_sizes)
-		assert sum(part_sizes) == steps
+	# set up a series run
+	fullblocks, remainder = divmod(steps, blocksize)
+	extrablock = (1 if remainder else 0)
 
-		with open(VARFILE_SERIES_ALLDIRS, 'wt') as f:
-			f.writelines('%s\n' % s for s in part_names)
+	# These values are only used if this is our first time running the stage.
+	# When resuming an interrupted run, we use the names/sizes originally chosen for that run.
+	# (thus, it is safe to e.g. modify this script and change the format of the names, and this
+	#  will not impact any existing, incomplete runs)
+	names_if_new = ['{:03d}'.format(i+1) for i in range(fullblocks + extrablock)]
+	sizes_if_new = [blocksize]*fullblocks + [remainder]*extrablock
+	assert len(names_if_new) == len(sizes_if_new)
+	assert sum(sizes_if_new) == steps
 
-		for name,size in zip(part_names, part_sizes):
-			mkdir(name)
-			with pushd(name):
-				copy_file('../INCAR', 'INCAR')
-				file_subst('INCAR', STEPS_REPL, size)
+	def do_iter(i=0, sizes=sizes_if_new, names=names_if_new, prev=None):
+		if i == len(sizes):
+			# let code after the loop know the names that were actually used,
+			# since they may differ from `names_if_new`
+			return EndLoop(names)
 
-	# run
-	for _ in runonce('nve.has_run'):
-		do_series(vasp_cmd)
+		cur, size = names[i], sizes[i]
+
+		make_trial_subdir(cur, prev)
+		with pushd(cur):
+			copy_file('../INCAR', 'INCAR')
+			file_subst('INCAR', STEPS_REPL, size)
+
+			vasp_cmd()
+
+		return i+1, sizes, names, cur
+
+	true_names = persistent_loop(do_iter, path='nve.state')
 
 	# finalize
-	lastdir = stripped_lines(VARFILE_SERIES_ALLDIRS)[-1]
-	temperature = read_final_temp(join(lastdir, 'OSZICAR'))
-	with open(VARFILE_FINAL_TEMP, 'wt') as f:
-		f.write('%s\n'%temperature)
+	copy_file(join(true_names[-1], 'WAVECAR'), 'WAVECAR')
+	copy_file(join(true_names[-1], 'CONTCAR'), 'CONTCAR')
+
+	return true_names
 
 def do_nose(vasp_cmd, *, steps):
 	file_subst('INCAR', STEPS_REPL, steps)
 
 	vasp_cmd()
 
+	return ['.']
 
+def do_vasp():
+	from subprocess import check_call
+	check_call(VASP_BIN_NAME, shell=True)
+
+#------------------------------------------------
 
 def read_final_temp(oszicar):
 	# lazy hacky un-robust way
@@ -214,55 +248,6 @@ def read_final_temp(oszicar):
 			raise RuntimeError('read_final_temp failed to match pattern')
 		return temperature
 
-# Input files:
-#   ./series.alldirs
-#   ./POSCAR
-#   ./WAVECAR (optional)
-#   ./POTCAR
-#   ./KPOINTS
-#   ./(each entry in series.alldirs)/INCAR
-#   Possibly some output files in the individual entry dirs if
-#     we're continuing a previously interrupted run
-# Output files
-#   ./(each entry in series.alldirs)/(typical outputs)
-#   ./WAVECAR.in   (= the original WAVECAR)
-#   ./WAVECAR      (= the finished WAVECAR)
-#   ./CONTCAR
-def do_series(vasp_cmd):
-	from os import rename
-	dirs = stripped_lines(VARFILE_SERIES_ALLDIRS)
-
-	for _ in runonce('series.has_init'):
-		# Make WAVECAR.in
-		if not exists('WAVECAR.in'):
-			if exists('WAVECAR'):
-				rename('WAVECAR', 'WAVECAR.in')
-			else:
-				touch('WAVECAR.in')
-
-		for d in dirs:
-			with pushd(d):
-				symlink('../KPOINTS', 'KPOINTS')
-				symlink('../POTCAR', 'POTCAR')
-
-	# first sub-trial
-	with pushd(dirs[0]):
-		for _ in runonce('entry.finished'):
-			copy_file('../POSCAR', 'POSCAR')
-			copy_file('../WAVECAR.in', 'WAVECAR')
-			vasp_cmd()
-
-	# subsequent sub-trials
-	for prev, cur in window2(dirs):
-		for _ in runonce(join(cur, 'entry.finished')):
-			copy_file(join(prev, 'CONTCAR'), join(cur, 'POSCAR'))
-			copy_file(join(prev, 'WAVECAR'), join(cur, 'WAVECAR'))
-			with pushd(cur):
-				vasp_cmd()
-
-	# finalize
-	copy_file(join(dirs[-1], 'WAVECAR'), 'WAVECAR')
-	copy_file(join(dirs[-1], 'CONTCAR'), 'CONTCAR')
 
 
 
@@ -316,6 +301,10 @@ def stripped_lines(path):
 		lines = [s for s in lines if s]
 		return lines
 
+def write_lines(lines, path):
+	with open(path, 'wt') as f:
+		f.writelines('%s\n' % x for x in lines)
+
 # like ln -sf
 def symlink(src, dest):
 	from os import symlink as _symlink, unlink
@@ -349,26 +338,88 @@ def touch(path):
 # Some very un-Pythonic syntax hacks in an attempt to make the code
 #  easier to read and verify
 
-# TODO kill 'runonce', it increases the number of paths through the code
-#   and actually makes it MORE difficult to reason about correctness
+class EndLoop():
+	def __init__(self, value):
+		self.value = value
 
-# Conditionally perform actions only if a certain file does not exist,
-#  and create it once we're done.
+# Make a sort of iterator that records its current state in a file.
 #
-# The way it works is as an iterator which creates the file on the
-#  second iteration (and which does zero iterations if the file already
-#  exists)
+#  f(*args) -> nextargs  A function performed each iteration, which either returns:
+#                         a) A tuple containing the next values for the arguments
+#                         b) EndLoop(result), or
+#                         c) EndLoop (equivalent to EndLoop(None))
+#                        Arguments must be pickleable.
+#  path                  Where to save the state.
 #
-# Use it like this:
-#     for _ in runonce('./has_initialized'):
-#         ... # do things if the file 'has_initialized' does not exist
-#     # upon exiting the block successfully, the file is created.
+# Use like this:
 #
-def runonce(markerfile):
-	if not exists(markerfile):
-		yield None # do one iteration
-		with open(markerfile, 'a'):
-			pass # create file
+#     # `sum(i for i in range(10))`  written as a persistent loop
+#     def do_iter(acc=0, i=0, n=10):
+#         if i >= n:
+#             return EndLoop(acc)
+#         return acc+i, i+1, n
+#
+#     s = persistent_loop(do_iter, 'numbers')
+#
+# The function must anticipate the following contingencies:
+#   * That any number of iterations at the beginning may be skipped
+#     (because they already ran in a previous run of the program)
+#   * That the state of the environment at the beginning of any given iteration may
+#     reflect changes from a previously interrupted run of the same iteration
+#
+# One must be cautious when allowing the function to close over variables.
+# While it may seem odd to keep passing `n` around in the above snippet, consider the following:
+#
+#     n = 10
+#     def do_iter(acc=0, i=0):
+#         if i >= n:
+#             return EndLoop(acc)
+#         return acc+i, i+1
+#
+#     s = persistent_loop(do_iter, 'numbers')
+#
+# These snippets will have different behavior if one were to interrupt a computation and then
+#  modify the value of `n`; upon resuming, the first snippet would continue to use 'n=10' (because
+#  it is part of the recorded state), while the second snippet would use the new value (because it
+#  gathers the value from outside the function).
+#
+# On that note, please think VERY CAREFULLY before putting a 'nonlocal' declaration in the
+#  function.  Chances are it will be much easier to avoid a logic error by simply keeping the
+#  variable in the state tuple instead, and returning it as part of the end result.
+#
+# This is partly the reason why `persistent_loop` has such an unusual API, rather than behaving
+#  more like an iterator.  In truth, several iterator-like designs were tried out prior to this
+#  design, but each were found to encourage making a variety of logic errors with regards to
+#  modification of local variables not preserved in the state tuple.
+def persistent_loop(f, path, initialstate=()):
+	def load():
+		from pickle import load as _load
+		with open(path, 'rb') as f:
+			return _load(f)
+
+	def save(st):
+		from pickle import dump
+		from os import rename
+		tmppath = path + '.tmp'
+		with open(tmppath, 'wb') as f:
+			dump(st, f)
+		rename(tmppath, path)
+
+	if not exists(path):
+		save(initialstate)
+
+	while True:
+		state = load()
+
+		if isinstance(state, EndLoop):
+			return state.value
+
+		state = f(*state)
+		# Support returning just EndLoop (without instantiation)
+		if state is EndLoop:
+			state = EndLoop(None)
+
+		save(state)
 
 # Like a shell pushd/popd pair
 # Use via 'with' syntax, like this:
