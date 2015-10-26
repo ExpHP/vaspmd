@@ -21,6 +21,7 @@ setup(
 	entry_points={
 		'console_scripts':[
 			'md-init = vaspmd.md_init:main',
+			'vasp-search = vaspmd.search:main',
 		],
 	},
 
@@ -29,6 +30,7 @@ setup(
 	],
 
 	install_requires=[
+		'pytoml',
 	],
 
 	packages=find_packages(), # include sub-packages
