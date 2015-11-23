@@ -129,7 +129,7 @@ def do_stage(vasp_cmd, *, stage, prevtemp, blocksize, linear_steps, nose_steps, 
 	if stage == STAGE_LINEAR:
 		return do_linear(vasp_cmd, steps=linear_steps, from_temp=prevtemp)
 	elif stage == STAGE_NOSE:
-		return do_nose(vasp_cmd, steps=nose_steps)
+		return do_nose(vasp_cmd, steps=nose_steps, blocksize=blocksize)
 	elif stage == STAGE_NVE:
 		return do_nve(vasp_cmd, steps=nve_steps, blocksize=blocksize)
 	else: assert False, 'complete switch'
@@ -168,6 +168,13 @@ def make_trial_subdir(name, continue_from_name=None):
 #  into INCAR), and they may or may not further divide their work up into multiple VASP runs.
 #  They return a list of "leaf" directories (as paths relative to '.') where VASP was run directly.
 
+# TODO need some easier way to reason about which replacement patterns in INCAR have been replaced/
+#  need to be replaced.  I'd imagine that simply turning the REPL globals into function arguments
+#  would help immensely.
+
+# NOTE: This is trickier to split up into a "series" computation than the other stages are
+#  due to TEBEG and TEEND.  I mean, it isn't impossible, but it would involve duplicating most
+#  of the code in `do_series`, as I really don't see a good abstraction for this.
 def do_linear(vasp_cmd, *, steps, from_temp):
 	file_subst('INCAR', STEPS_REPL, steps)
 	file_subst('INCAR', TEBEG_REPL, from_temp)
@@ -177,6 +184,15 @@ def do_linear(vasp_cmd, *, steps, from_temp):
 	return ['.']
 
 def do_nve(vasp_cmd, *, steps, blocksize):
+	# TODO search for decent starting point
+	return do_series(vasp_cmd, steps=steps, blocksize=blocksize)
+
+def do_nose(vasp_cmd, *, steps, blocksize):
+	return do_series(vasp_cmd, steps=steps, blocksize=blocksize)
+
+# split a simple computation up into multiple steps with identical INCARs (up to NSW), for the
+#  purpose of reducing the amount of work lost from an interrupted computation
+def do_series(vasp_cmd, *, steps, blocksize):
 
 	# set up a series run
 	fullblocks, remainder = divmod(steps, blocksize)
@@ -208,7 +224,7 @@ def do_nve(vasp_cmd, *, steps, blocksize):
 
 		return i+1, sizes, names, cur
 
-	true_names = persistent_loop(do_iter, path='nve.state')
+	true_names = persistent_loop(do_iter, path='series.state')
 
 	# finalize
 	copy_file(join(true_names[-1], 'WAVECAR'), 'WAVECAR')
@@ -216,12 +232,6 @@ def do_nve(vasp_cmd, *, steps, blocksize):
 
 	return true_names
 
-def do_nose(vasp_cmd, *, steps):
-	file_subst('INCAR', STEPS_REPL, steps)
-
-	vasp_cmd()
-
-	return ['.']
 
 def do_vasp():
 	from subprocess import check_call
